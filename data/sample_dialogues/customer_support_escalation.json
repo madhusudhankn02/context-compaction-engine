@@ -1,0 +1,16 @@
+{
+  "workflow_id": "wf-cs-escalation-0001",
+  "scenario": "customer_support_escalation",
+  "turns": [
+    {"turn_index": 0, "agent_name": "user", "role": "user", "content": "My order #88213 arrived damaged and I need a refund today, I have a hard budget cap of $50 for any replacement shipping fee."},
+    {"turn_index": 1, "agent_name": "triage_agent", "role": "agent", "content": "Acknowledged. Order #88213 damaged on arrival. I'm escalating to the refunds specialist agent."},
+    {"turn_index": 2, "agent_name": "refunds_agent", "role": "agent", "content": "I've looked up order #88213: it was a $129.99 purchase placed on June 2nd. Policy allows full refund within 30 days for damaged goods."},
+    {"turn_index": 3, "agent_name": "refunds_agent", "role": "agent", "content": "Decision: issuing a full refund of $129.99 to the original payment method."},
+    {"turn_index": 4, "agent_name": "user", "role": "user", "content": "Actually, instead of a refund, can I get a replacement shipped instead? I still need the item."},
+    {"turn_index": 5, "agent_name": "refunds_agent", "role": "agent", "content": "Understood, switching the resolution from refund to replacement shipment per the customer's updated request."},
+    {"turn_index": 6, "agent_name": "logistics_agent", "role": "agent", "content": "Checked inventory: replacement unit is in stock at warehouse W-12. Expedited shipping fee would be $65, which exceeds the customer's stated $50 cap."},
+    {"turn_index": 7, "agent_name": "logistics_agent", "role": "agent", "content": "Open question: should we use standard shipping (free, 5-7 days) to stay within the $50 cap, or request a one-time fee waiver for expedited shipping?"},
+    {"turn_index": 8, "agent_name": "user", "role": "user", "content": "Standard shipping is fine, I don't need it urgently."},
+    {"turn_index": 9, "agent_name": "logistics_agent", "role": "agent", "content": "Decision: replacement unit for order #88213 will ship via standard shipping at no charge, ETA 5-7 business days."}
+  ]
+}

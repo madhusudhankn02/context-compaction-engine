@@ -1,0 +1,20 @@
+# Core (always required)
+pydantic>=2.7,<3.0
+pydantic-settings>=2.2,<3.0
+langchain-core>=0.3,<0.4
+
+# Provider adapters — install the one(s) matching COMPACTION_LLM_PROVIDER
+langchain-anthropic>=0.3,<0.4   # provider=anthropic
+# langchain-openai>=0.2,<0.3     # provider=openai
+# langchain-ollama>=0.2,<0.3     # provider=local_ollama
+
+# Optional: higher-quality semantic dedup/validation (else falls back to lexical Jaccard)
+# sentence-transformers>=3.0,<4.0
+
+# Phase 1 testing
+pytest>=8.0,<9.0
+pytest-cov>=5.0,<6.0
+
+# Lint/type-check (matches pyproject.toml [tool.ruff] / [tool.mypy])
+ruff>=0.6,<0.7
+mypy>=1.11,<2.0
