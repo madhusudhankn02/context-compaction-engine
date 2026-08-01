@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package compaction.v1;
+
+option py_generic_services = false;
+
+// ── CompactionService ────────────────────────────────────────────────────────
+// Transparent drop-in for the REST /v1/compress and /v1/validate endpoints.
+// Agents that already use gRPC (e.g., internal microservices) call this
+// directly; the REST bridge and this gRPC service share the same
+// FallbackRouter instance behind the DI container.
+service CompactionService {
+  // Compress raw agent dialogue into a structured, schema-validated state.
+  rpc Compress(CompressRequest) returns (CompressResponse);
+
+  // Validate a compressed state against a gold-standard reference trajectory.
+  rpc Validate(ValidateRequest) returns (ValidateResponse);
+
+  // Liveness + readiness probe for k8s sidecar health checks.
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// ── Shared message types ─────────────────────────────────────────────────────
+
+message RawTurn {
+  uint32 turn_index    = 1;
+  string agent_name    = 2;
+  string role          = 3;   // "user" | "agent" | "tool"
+  string content       = 4;
+  string timestamp_iso = 5;   // RFC 3339 / ISO 8601; empty = server assigns
+}
+
+// Opaque JSON blob carrying a CompressedContextState.
+// Using string/JSON here (rather than expanding every field into proto
+// messages) is a deliberate trade-off: the domain schema evolves rapidly in
+// Phase 1-3, and proto field-number stability requirements would slow that
+// down. Phase 5 can introduce a fully-typed proto once the schema stabilises.
+message StatePayload {
+  string json = 1;             // JSON-serialized CompressedContextState
+  string schema_version = 2;   // "0.1.0" — allows receiver to reject incompatible versions
+}
+
+// ── Compress RPC ─────────────────────────────────────────────────────────────
+
+message CompressRequest {
+  string workflow_id = 1;
+  repeated RawTurn turns = 2;
+}
+
+message CompressResponse {
+  string workflow_id       = 1;
+  string route             = 2;   // "compressed" | "passthrough" | "noop"
+  double compression_ratio = 3;
+  double latency_ms        = 4;
+  uint32 fact_count        = 5;
+  uint32 source_turn_count = 6;
+  uint32 token_count_estimate = 7;
+  repeated string warnings = 8;
+  string fallback_reason   = 9;   // empty string if no fallback
+  StatePayload state       = 10;
+}
+
+// ── Validate RPC ─────────────────────────────────────────────────────────────
+
+message ValidateRequest {
+  StatePayload gold_standard = 1;
+  StatePayload compressed    = 2;
+  double match_threshold     = 3;  // default 0.75
+}
+
+message FidelityReport {
+  string workflow_id           = 1;
+  double fact_recall           = 2;
+  double fact_precision        = 3;
+  double hallucination_rate    = 4;
+  double constraint_recall     = 5;
+  double open_question_recall  = 6;
+  double overall_fidelity_score = 7;
+  bool   passed                = 8;
+  repeated string notes        = 9;
+}
+
+message ValidateResponse {
+  FidelityReport report = 1;
+  bool passed           = 2;
+}
+
+// ── Health RPC ───────────────────────────────────────────────────────────────
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status   = 1;   // "ok" | "degraded"
+  string provider = 2;
+  string model    = 3;
+  string version  = 4;
+}

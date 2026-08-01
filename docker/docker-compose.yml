@@ -1,0 +1,62 @@
+version: "3.9"
+
+# ── Shared config ─────────────────────────────────────────────────────────────
+x-common-env: &common-env
+  COMPACTION_LLM_PROVIDER: ${COMPACTION_LLM_PROVIDER:-anthropic}
+  COMPACTION_LLM_MODEL_NAME: ${COMPACTION_LLM_MODEL_NAME:-claude-haiku-4-5-20251001}
+  COMPACTION_LLM_TEMPERATURE: "0.0"
+  COMPACTION_LOG_LEVEL: ${COMPACTION_LOG_LEVEL:-INFO}
+  COMPACTION_ENABLE_JSON_LOGGING: "true"
+  COMPACTION_MAX_TURNS_PER_CHUNK: "8"
+  COMPACTION_DEDUP_COSINE_THRESHOLD: "0.92"
+  # Inject real API key via .env or CI secret — never hardcode here.
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+
+services:
+
+  # ── REST bridge ─────────────────────────────────────────────────────────────
+  rest:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: compaction-engine:rest
+    container_name: compaction-rest
+    environment:
+      <<: *common-env
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - compaction-net
+
+  # ── gRPC server ─────────────────────────────────────────────────────────────
+  # NOTE: requires `bash scripts/compile_proto.sh` before `docker compose up`
+  grpc:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: compaction-engine:grpc
+    container_name: compaction-grpc
+    environment:
+      <<: *common-env
+    # Override the default CMD to run the gRPC server instead of uvicorn.
+    command:
+      - python
+      - -m
+      - compaction_engine.bridge.grpc.server
+    ports:
+      - "50051:50051"
+    restart: unless-stopped
+    networks:
+      - compaction-net
+
+networks:
+  compaction-net:
+    driver: bridge
