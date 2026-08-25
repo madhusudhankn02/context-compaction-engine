@@ -60,6 +60,11 @@ def bridge_settings() -> EngineSettings:
         min_acceptable_fact_recall=0.90,
         max_acceptable_hallucination_rate=0.02,
         min_acceptable_constraint_recall=0.99,
+        # Bridge tests exercise HTTP/router behaviour, not cost-prediction logic.
+        # Set thresholds very low so the ArbitrationGate never NOOP-blocks the
+        # seeded test turns (which are deliberately short for fixture simplicity).
+        cost_saving_threshold_tokens=1,
+        cost_min_turns_to_compress=1,
     )
 
 
@@ -71,15 +76,36 @@ def seeded_extractor() -> FakeStructuredExtractor:
 
 @pytest.fixture
 def bridge_container(bridge_settings, seeded_extractor) -> BridgeContainer:
+    from compaction_engine.cost.arbitration import ArbitrationGate
+    from compaction_engine.cost.features import FeatureExtractor
+    from compaction_engine.cost.ledger import CostLedger
+    from compaction_engine.cost.predictor import CostPredictor
+
     dedup = FactDeduplicator(bridge_settings, embedder=None)
     pipeline = ExtractionPipeline(bridge_settings, seeded_extractor, deduplicator=dedup)
-    router = FallbackRouter(pipeline, bridge_settings)
+
+    cost_predictor = CostPredictor(bridge_settings)
+    cost_ledger = CostLedger(bridge_settings)
+    arbitration_gate = ArbitrationGate(
+        predictor=cost_predictor,
+        settings=bridge_settings,
+        extractor=FeatureExtractor(),
+    )
+    router = FallbackRouter(
+        pipeline=pipeline,
+        settings=bridge_settings,
+        arbitration_gate=arbitration_gate,
+        cost_ledger=cost_ledger,
+    )
     return BridgeContainer(
         settings=bridge_settings,
         extractor=seeded_extractor,
         deduplicator=dedup,
         pipeline=pipeline,
         router=router,
+        cost_predictor=cost_predictor,
+        cost_ledger=cost_ledger,
+        arbitration_gate=arbitration_gate,
     )
 
 
