@@ -68,6 +68,10 @@ class TestCompressEndpoint:
         from compaction_engine.bridge.container import BridgeContainer
         from compaction_engine.bridge.rest.app import create_app
         from compaction_engine.bridge.router import FallbackRouter
+        from compaction_engine.cost.arbitration import ArbitrationGate
+        from compaction_engine.cost.features import FeatureExtractor
+        from compaction_engine.cost.ledger import CostLedger
+        from compaction_engine.cost.predictor import CostPredictor
         from compaction_engine.extraction.pipeline import ExtractionPipeline
         from compaction_engine.extraction.reranker import FactDeduplicator
         from compaction_engine.utils.exceptions import SchemaValidationError
@@ -79,17 +83,46 @@ class TestCompressEndpoint:
 
         dedup = FactDeduplicator(bridge_settings, embedder=None)
         pipeline = ExtractionPipeline(bridge_settings, _AlwaysFailExtractor(), deduplicator=dedup)
-        router = FallbackRouter(pipeline, bridge_settings)
+        cost_predictor = CostPredictor(bridge_settings)
+        cost_ledger = CostLedger(bridge_settings)
+        arbitration_gate = ArbitrationGate(
+            predictor=cost_predictor,
+            settings=bridge_settings,
+            extractor=FeatureExtractor(),
+        )
+        router = FallbackRouter(
+            pipeline=pipeline,
+            settings=bridge_settings,
+            arbitration_gate=arbitration_gate,
+            cost_ledger=cost_ledger,
+        )
         container = BridgeContainer(
-            settings=bridge_settings, extractor=_AlwaysFailExtractor(),
-            deduplicator=dedup, pipeline=pipeline, router=router,
+            settings=bridge_settings,
+            extractor=_AlwaysFailExtractor(),
+            deduplicator=dedup,
+            pipeline=pipeline,
+            router=router,
+            cost_predictor=cost_predictor,
+            cost_ledger=cost_ledger,
+            arbitration_gate=arbitration_gate,
         )
         with TestClient(create_app(container=container)) as client:
             resp = client.post(
                 "/v1/compress",
                 json={
                     "workflowId": "wf-fail",
-                    "turns": [{"turnIndex": 0, "agentName": "a", "role": "agent", "content": "hi"}],
+                    # 3 turns with enough content to clear both the
+                    # cost_min_turns_to_compress and raw_token_estimate
+                    # heuristic checks, so the failing extractor is reached.
+                    "turns": [
+                        {
+                            "turnIndex": i,
+                            "agentName": "agent",
+                            "role": "agent",
+                            "content": "Detailed discussion about the procurement budget approval workflow process.",
+                        }
+                        for i in range(3)
+                    ],
                 },
             )
         assert resp.status_code == 200

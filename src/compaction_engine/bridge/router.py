@@ -1,27 +1,16 @@
 """
 FallbackRouter — the production-grade wrapper around ExtractionPipeline.
 
-This is Phase 2's most important class. From the problem statement:
+Phase 3 adds two optional injected dependencies:
+  - ArbitrationGate: consulted BEFORE attempting compression; if it returns
+    NOOP, the router skips the LLM call entirely and returns a passthrough
+    with route=CompressionRoute.NOOP.
+  - CostLedger: records every outcome (compressed, passthrough, noop) for
+    cost accounting and model training.
 
-    "Build fallback routing: if compression causes an agent to fail,
-     automatically escalate to uncompressed state and log the failure."
-
-The router enforces three properties:
-
-1. TRANSPARENT TO AGENTS: agents never see a failure. They call compress();
-   they always get back a valid CompressedContextState. If compression
-   fails, they get a passthrough state (all turns represented as facts) —
-   same schema, different route tag.
-
-2. ADAPTIVE THRESHOLD (exponential backoff): if a compressed step triggers
-   fallback, the compression threshold for subsequent calls on the same
-   workflow is increased, progressively trusting compression less for
-   workflows that have demonstrated instability. Phase 3's cost predictor
-   reads the `_threshold_registry` as a feature.
-
-3. FULLY OBSERVABLE: every call, whether successful or fallback, produces
-   a `CompressionResult` with a complete `.to_audit_dict()` that Phase 4
-   can persist directly. Nothing is swallowed silently.
+When neither is supplied (the default), the router behaves exactly as in
+Phase 2 — compresses everything, no cost gating.  Phase 2 tests therefore
+need no changes.
 """
 
 from __future__ import annotations
@@ -29,6 +18,7 @@ from __future__ import annotations
 import time
 import uuid
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from compaction_engine.bridge.result import CompressionResult, CompressionRoute
 from compaction_engine.config import EngineSettings
@@ -47,11 +37,13 @@ from compaction_engine.utils.exceptions import (
 )
 from compaction_engine.utils.logging_config import get_logger
 
+if TYPE_CHECKING:
+    from compaction_engine.cost.arbitration import ArbitrationGate
+    from compaction_engine.cost.ledger import CostLedger
+
 logger = get_logger(__name__)
 
-# Maximum multiplier the backoff can reach before capping.
 _MAX_BACKOFF_MULTIPLIER: float = 4.0
-# Factor by which the threshold is tightened on each fallback event.
 _BACKOFF_STEP: float = 0.05
 
 
@@ -59,15 +51,6 @@ def _build_passthrough_state(
     workflow_id: str,
     turns: list[RawDialogueTurn],
 ) -> CompressedContextState:
-    """
-    Converts raw turns into a valid CompressedContextState with zero
-    information loss. Each turn becomes one EXTERNAL_FACT (confidence=HIGH,
-    turn range = that single turn). This preserves the downstream agent's
-    ability to consume a typed state even when the compressor failed.
-
-    Token estimate is deliberately the raw sum — the passthrough offers
-    NO savings, which Phase 3 will correctly price as cost_saving=0.
-    """
     facts: list[ExtractedFact] = []
     for turn in turns:
         facts.append(
@@ -81,38 +64,28 @@ def _build_passthrough_state(
                 confidence=ConfidenceLevel.HIGH,
             )
         )
-
     raw_text = "\n".join(t.content for t in turns)
-    token_estimate = max(1, len(raw_text) // 4)
-
     return CompressedContextState(
         workflow_id=workflow_id,
         compaction_version=1,
         source_turn_count=len(turns),
         facts=tuple(facts),
-        token_count_estimate=token_estimate,
+        token_count_estimate=max(1, len(raw_text) // 4),
     )
 
 
 class FallbackRouter:
-    """
-    Stateful per-process router.
-
-    Thread-safety note: `_threshold_registry` is mutated on fallback events.
-    In a multi-threaded server (uvicorn + multiple workers) each process has
-    its own registry, which is correct — backoff state is per-worker. For
-    shared state across workers, Phase 4's Redis/PostgreSQL layer should be
-    used. This is documented, not papered over.
-    """
-
     def __init__(
         self,
         pipeline: ExtractionPipeline,
         settings: EngineSettings,
+        arbitration_gate: "ArbitrationGate | None" = None,
+        cost_ledger: "CostLedger | None" = None,
     ) -> None:
         self._pipeline = pipeline
         self._settings = settings
-        # workflow_id -> current backoff multiplier (1.0 = no backoff)
+        self._gate = arbitration_gate
+        self._ledger = cost_ledger
         self._threshold_registry: dict[str, float] = {}
 
     def get_backoff_multiplier(self, workflow_id: str) -> float:
@@ -123,19 +96,30 @@ class FallbackRouter:
         workflow_id: str,
         turns: list[RawDialogueTurn],
     ) -> CompressionResult:
-        """
-        Main entry point. Always returns a CompressionResult with a valid
-        CompressedContextState. Never raises — caller gets a PASSTHROUGH
-        result instead.
-        """
         if not turns:
             raise ValueError(f"compress() called with empty turn list for workflow {workflow_id!r}")
 
-        t0 = time.monotonic()
+        backoff = self.get_backoff_multiplier(workflow_id)
 
+        # ── Phase 3: Arbitration gate ────────────────────────────────────────
+        if self._gate is not None:
+            decision = self._gate.evaluate(workflow_id, turns, backoff)
+            if not decision.should_compress:
+                return self._handle_noop(workflow_id, turns, decision)
+
+        # ── Attempt compression ──────────────────────────────────────────────
+        t0 = time.monotonic()
         try:
             run_result = self._pipeline.run(workflow_id, turns)
             latency_ms = (time.monotonic() - t0) * 1000
+
+            result = CompressionResult(
+                state=run_result.final_state,
+                route=CompressionRoute.COMPRESSED,
+                run_result=run_result,
+                latency_ms=latency_ms,
+                warnings=run_result.warnings,
+            )
 
             logger.info(
                 "Compression succeeded",
@@ -147,24 +131,46 @@ class FallbackRouter:
                     "latency_ms": round(latency_ms, 2),
                 },
             )
-            return CompressionResult(
-                state=run_result.final_state,
-                route=CompressionRoute.COMPRESSED,
-                run_result=run_result,
-                latency_ms=latency_ms,
-                warnings=run_result.warnings,
-            )
+
+            # ── Train predictor + record in ledger ───────────────────────────
+            if self._gate is not None:
+                # `decision` is in scope from the gate check above.
+                self._gate.record_outcome(decision.features, result)  # type: ignore[possibly-undefined]
+                self._record_in_ledger(result, decision, "compressed")  # type: ignore[possibly-undefined]
+
+            self.reset_backoff(workflow_id)
+            return result
 
         except (ExtractionFidelityError, SchemaValidationError) as exc:
             return self._handle_fallback(workflow_id, turns, exc, t0, is_expected=True)
-
         except CompactionEngineError as exc:
             return self._handle_fallback(workflow_id, turns, exc, t0, is_expected=False)
-
         except Exception as exc:  # noqa: BLE001
-            # Unexpected errors (e.g. OOM, provider SDK bug) still produce a
-            # passthrough — we NEVER let a compression bug crash an agent.
             return self._handle_fallback(workflow_id, turns, exc, t0, is_expected=False)
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _handle_noop(
+        self,
+        workflow_id: str,
+        turns: list[RawDialogueTurn],
+        decision: "ArbitrationDecision",  # type: ignore[name-defined]
+    ) -> CompressionResult:
+        passthrough_state = _build_passthrough_state(workflow_id, turns)
+        result = CompressionResult(
+            state=passthrough_state,
+            route=CompressionRoute.NOOP,
+            fallback_reason=decision.reason,
+            latency_ms=0.0,
+            warnings=[f"ArbitrationGate NOOP: {decision.reason}"],
+        )
+        if self._ledger is not None:
+            self._ledger.record_noop(decision.features, decision.reason)
+        logger.info(
+            "ArbitrationGate NOOP — skipped compression",
+            extra={"workflow_id": workflow_id, "reason": decision.reason},
+        )
+        return result
 
     def _handle_fallback(
         self,
@@ -177,21 +183,18 @@ class FallbackRouter:
     ) -> CompressionResult:
         latency_ms = (time.monotonic() - t0) * 1000
         reason = f"{type(exc).__name__}: {exc}"
-
         self._apply_backoff(workflow_id)
 
-        log_level = logger.warning if is_expected else logger.error
-        log_level(
+        log = logger.warning if is_expected else logger.error
+        log(
             "Compression failed — routing to passthrough",
             extra={
                 "workflow_id": workflow_id,
-                "route": CompressionRoute.PASSTHROUGH.value,
                 "fallback_reason": reason,
                 "backoff_multiplier": self._threshold_registry.get(workflow_id, 1.0),
                 "latency_ms": round(latency_ms, 2),
             },
         )
-
         passthrough_state = _build_passthrough_state(workflow_id, turns)
         return CompressionResult(
             state=passthrough_state,
@@ -202,27 +205,30 @@ class FallbackRouter:
         )
 
     def _apply_backoff(self, workflow_id: str) -> None:
-        """
-        Exponential backoff: each fallback event raises the effective
-        dedup threshold (making compression more conservative) up to
-        _MAX_BACKOFF_MULTIPLIER. The pipeline reads dedup_cosine_threshold
-        from settings, so backoff is registered here for Phase 3 to consume
-        as a feature — it does NOT currently mutate settings (which are
-        frozen/cached). Phase 3's arbitration layer will use the multiplier
-        to decide whether to attempt compression at all.
-        """
         current = self._threshold_registry.get(workflow_id, 1.0)
-        new_multiplier = min(current + _BACKOFF_STEP, _MAX_BACKOFF_MULTIPLIER)
-        self._threshold_registry[workflow_id] = new_multiplier
+        new_mult = min(current + _BACKOFF_STEP, _MAX_BACKOFF_MULTIPLIER)
+        self._threshold_registry[workflow_id] = new_mult
         logger.info(
             "Backoff applied",
-            extra={
-                "workflow_id": workflow_id,
-                "backoff_multiplier": new_multiplier,
-            },
+            extra={"workflow_id": workflow_id, "backoff_multiplier": new_mult},
         )
 
     def reset_backoff(self, workflow_id: str) -> None:
-        """Call this after a successful compression run to recover from a
-        transient failure sequence without permanently penalizing a workflow."""
         self._threshold_registry.pop(workflow_id, None)
+
+    def _record_in_ledger(
+        self,
+        result: CompressionResult,
+        decision: "ArbitrationDecision",  # type: ignore[name-defined]
+        _route_hint: str,
+    ) -> None:
+        if self._ledger is None:
+            return
+        pred = decision.prediction
+        self._ledger.record_compression(
+            result=result,
+            features=decision.features,
+            arbitration_reason=decision.reason,
+            predictor_model=pred.model_used if pred else "none",
+            expected_saving_tokens=pred.expected_saving_tokens if pred else 0,
+        )

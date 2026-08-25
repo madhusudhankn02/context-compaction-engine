@@ -61,6 +61,27 @@ class EngineSettings(BaseSettings):
     max_acceptable_hallucination_rate: float = Field(default=0.02, ge=0.0, le=1.0)
     min_acceptable_constraint_recall: float = Field(default=0.99, ge=0.0, le=1.0)
 
+    # --- Cost prediction & arbitration (Phase 3) ---
+    # Minimum expected token saving to justify attempting compression.
+    # Below this, the ArbitrationGate returns NOOP and skips compression entirely.
+    cost_saving_threshold_tokens: int = Field(default=50, ge=0)
+
+    # Minimum number of turns a dialogue must have before compression is even considered.
+    # Very short dialogues almost never compress profitably.
+    cost_min_turns_to_compress: int = Field(default=3, ge=1)
+
+    # Number of completed workflow samples needed before the gradient-boosting model
+    # replaces the rule-based heuristic predictor.
+    cost_predictor_min_samples: int = Field(default=10, ge=2)
+
+    # Token price used for dollar-cost ledger entries (USD per million tokens).
+    # Default matches Claude Haiku 3.5 input pricing as of 2025.
+    cost_token_price_per_million_usd: float = Field(default=0.80, ge=0.0)
+
+    # Maximum backoff multiplier above which the ArbitrationGate refuses to compress
+    # (workflow has failed too many times; not worth risking another attempt).
+    cost_max_backoff_to_compress: float = Field(default=3.0, gt=0.0)
+
     # --- Observability ---
     log_level: str = "INFO"
     enable_json_logging: bool = True
